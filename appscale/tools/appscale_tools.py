@@ -500,16 +500,7 @@ class AppScaleTools(object):
     head_node = node_layout.head_node()
     # Start VMs in cloud via cloud agent.
     if options.infrastructure:
-      instance_ids, public_ips, private_ips = RemoteHelper.start_all_nodes(
-        options, len(node_layout.nodes))
-      AppScaleLogger.log("\nPlease wait for AppScale to prepare your machines "
-                         "for use. This can take few minutes.")
-
-      # Set newly obtained node layout info for this deployment.
-      for i, _ in enumerate(instance_ids):
-        node_layout.nodes[i].public_ip = public_ips[i]
-        node_layout.nodes[i].private_ip = private_ips[i]
-        node_layout.nodes[i].instance_id = instance_ids[i]
+      node_layout = RemoteHelper.start_all_nodes(options, node_layout)
 
       # Enables root logins and SSH access on the head node.
       RemoteHelper.enable_root_ssh(options, head_node.public_ip)

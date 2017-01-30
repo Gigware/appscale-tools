@@ -519,13 +519,6 @@ class NodeLayout():
       master_node.add_role('taskqueue')
       master_node.add_role('taskqueue_master')
 
-    # Any node that runs appengine needs taskqueue to dispatch task requests to
-    # It's safe to add the slave role since we ensure above that somebody
-    # already has the master role
-    for node in nodes:
-      if node.is_role('appengine') and not node.is_role('taskqueue'):
-        node.add_role('taskqueue_slave')
-
     if self.disks:
       valid, reason = self.is_disks_valid(nodes)
       if not valid:
@@ -661,6 +654,30 @@ class NodeLayout():
       if not node.is_role('shadow'):
         other_nodes.append(node)
     return other_nodes
+
+  def get_nodes(self, role, is_role):
+    """ Searches through the nodes in this NodeLayout for all nodes with or
+    without the role based on boolean value of is_role.
+
+    Args:
+      role: A string describing a role that the nodes list is being searched
+        for.
+      is_role: A boolean to determine whether the return value is the nodes
+        that are the role or the nodes that are not the role.
+
+    Returns:
+      A list of nodes either running or not running (based on is_role) the
+      argument role role, or the empty list if the NodeLayout isn't
+      acceptable for use with AppScale.
+    """
+    if not self.is_valid() or role not in self.VALID_ROLES:
+      return []
+
+    nodes_requested = []
+    for node in self.nodes:
+      if node.is_role(role) == is_role:
+        nodes_requested.append(node)
+    return nodes_requested
 
 
   def db_master(self):
