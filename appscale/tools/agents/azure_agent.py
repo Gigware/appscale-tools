@@ -6,6 +6,7 @@ interact with Microsoft Azure.
 
 # General-purpose Python library imports
 import adal
+import math
 import os.path
 import threading
 import time
@@ -112,7 +113,7 @@ class AzureAgent(BaseAgent):
   PARAM_TENANT_ID = 'azure_tenant_id'
   PARAM_TEST = 'test'
   PARAM_TAG = 'azure_group_tag'
-  PARAM_VERBOSE = 'is_verbose'
+  PARAM_VERBOSE = 'IS_VERBOSE'
   PARAM_ZONE = 'zone'
 
   # A set that contains all of the items necessary to run AppScale in Azure.
@@ -140,13 +141,13 @@ class AzureAgent(BaseAgent):
 
   # The maximum number of seconds to wait for an Azure VM to be created.
   # (Takes longer than the creation time for other resources.)
-  MAX_VM_CREATION_TIME = 240
+  MAX_VM_UPDATE_TIME = 240
 
   # The maximum number of seconds to wait for an Azure scale set to be created.
   MAX_VMSS_WAIT_TIME = 300
 
   # The maximum limit of allowable VMs within a scale set.
-  MAX_VMSS_CAPACITY = 40
+  MAX_VMSS_CAPACITY = 20
 
   # The Virtual Network and Subnet name to use while creating an Azure
   # Virtual machine.
@@ -281,9 +282,10 @@ class AzureAgent(BaseAgent):
         for ip_config in network_interface.ip_configurations:
           public_ips.append(ip_config.private_ip_address)
           private_ips.append(ip_config.private_ip_address)
+
     return public_ips, private_ips, instance_ids
 
-  def run_instances(self, count, parameters, security_configured):
+  def run_instances(self, count, parameters, security_configured, public_ip_needed):
     """ Starts 'count' instances in Microsoft Azure, and returns once they
     have been started. Callers should create a network and attach a firewall
     to it before using this method, or the newly created instances will not
@@ -307,16 +309,27 @@ class AzureAgent(BaseAgent):
     network_client = NetworkManagementClient(credentials, subscription_id)
     subnet = self.create_virtual_network(network_client, parameters,
                                          virtual_network, virtual_network)
-    vm_network_name = Haikunator().haikunate()
-    self.create_network_interface(network_client, vm_network_name, vm_network_name,
-                                  subnet, parameters)
-    network_interface = network_client.network_interfaces.get(
-      resource_group, vm_network_name)
-    self.create_virtual_machine(credentials, network_client,
-      network_interface.id, parameters, vm_network_name)
 
-    self.create_or_update_vm_scale_sets(count-1, parameters, subnet)
+    active_public_ips, active_private_ips, active_instances = \
+      self.describe_instances(parameters)
+
+    if public_ip_needed:
+      for _ in range(count):
+        vm_network_name = Haikunator().haikunate()
+        self.create_network_interface(network_client, vm_network_name, vm_network_name,
+                                      subnet, parameters)
+        network_interface = network_client.network_interfaces.get(
+          resource_group, vm_network_name)
+        self.create_virtual_machine(credentials, network_client,
+          network_interface.id, parameters, vm_network_name)
+    else:
+      self.create_or_update_vm_scale_sets(count, parameters, subnet)
+
     public_ips, private_ips, instance_ids = self.describe_instances(parameters)
+    public_ips = self.diff(public_ips, active_public_ips)
+    private_ips = self.diff(private_ips, active_private_ips)
+    instance_ids = self.diff(instance_ids, active_instances)
+
     return instance_ids, public_ips, private_ips
 
   def create_virtual_machine(self, credentials, network_client, network_id,
@@ -375,7 +388,7 @@ class AzureAgent(BaseAgent):
       public_ip_address = network_client.public_ip_addresses.get(resource_group,
                                                                  vm_network_name)
       if public_ip_address.ip_address:
-        AppScaleLogger.log('Azure VM is available at {}'.
+        AppScaleLogger.log('Azure load balancer VM is available at {}'.
                            format(public_ip_address.ip_address))
         break
       AppScaleLogger.verbose("Waiting {} second(s) for IP address to be "
@@ -404,7 +417,7 @@ class AzureAgent(BaseAgent):
     return linux_config
 
   def create_or_update_vm_scale_sets(self, count, parameters, subnet):
-    """ Creates/Updates  a virtual machine scale set containing the given number
+    """ Creates/Updates a virtual machine scale set containing the given number
     of virtual machines with the virtual network provided.
     Args:
         count: The number of virtual machines to be created in the scale set.
@@ -421,23 +434,33 @@ class AzureAgent(BaseAgent):
     # Create multiple scale sets with the allowable maximum capacity of VMs.
     if count > self.MAX_VMSS_CAPACITY:
       # Count of the number of scale sets needed depending on the max capacity.
-      scale_set_count = (int(count) + self.MAX_VMSS_CAPACITY // 2) // self.MAX_VMSS_CAPACITY
+      scale_set_count = int(math.ceil(count / float(self.MAX_VMSS_CAPACITY)))
       remaining_vms_count = count
+
+      scalesets_threads = []
       for ss_count in range(scale_set_count):
         resource_name = random_resource_name + "-resource-{}".format(ss_count)
         scale_set_name = random_resource_name + "-scaleset-{}".format(ss_count)
         capacity = self.MAX_VMSS_CAPACITY
         if remaining_vms_count < self.MAX_VMSS_CAPACITY:
           capacity = remaining_vms_count
-        AppScaleLogger.verbose('Creating a Scale Set {0} with {1} VMs'.
+        AppScaleLogger.verbose('Creating a Scale Set {0} with {1} VM(s)'.
                                format(scale_set_name, capacity), verbose)
-        self.create_scale_set(capacity, parameters,
-                              resource_name, scale_set_name, subnet)
+
+        thread = threading.Thread(target=self.create_scale_set,
+                                  args=(capacity, parameters, resource_name,
+                                        scale_set_name, subnet))
+        thread.start()
+        scalesets_threads.append(thread)
         remaining_vms_count = remaining_vms_count - self.MAX_VMSS_CAPACITY
+
+      for ss_thread in scalesets_threads:
+        ss_thread.join()
+
     # Create a scale set using the count of VMs provided.
     else:
       scale_set_name = random_resource_name + "-scaleset-{}vms".format(count)
-      AppScaleLogger.verbose('Creating a Scale Set {0} with {1} VMs'.
+      AppScaleLogger.verbose('Creating a Scale Set {0} with {1} VM(s)'.
                              format(scale_set_name, count), verbose)
       self.create_scale_set(count, parameters, random_resource_name,
                             scale_set_name, subnet)
@@ -504,16 +527,16 @@ class AzureAgent(BaseAgent):
       create_update_response.wait(timeout=self.MAX_VMSS_WAIT_TIME)
       result = create_update_response.result()
       if result.provisioning_state == 'Succeeded':
-        AppScaleLogger.log("Scale Set '{0}' with {1} VMs has been successfully "
+        AppScaleLogger.log("Scale Set '{0}' with {1} VM(s) has been successfully "
                            "configured!".format(scale_set_name, count))
       else:
         AppScaleLogger.log("Unable to create a Scale Set of {0} "
-                           "VMs.Provisioning Status: {1}"
+                           "VM(s).Provisioning Status: {1}"
                            .format(count, result.provisioning_state))
 
     except CloudError as error:
       raise AgentConfigurationException("Unable to create a Scale Set of {0} "
-                                        " VMs: {1}".format(count, error.message))
+                                        "VM(s): {1}".format(count, error.message))
 
   def associate_static_ip(self, instance_id, static_ip):
     """ Associates the given static IP address with the given instance ID.
@@ -535,34 +558,49 @@ class AzureAgent(BaseAgent):
     subscription_id = parameters[self.PARAM_SUBSCRIBER_ID]
     verbose = parameters[self.PARAM_VERBOSE]
     public_ips, private_ips, instance_ids = self.describe_instances(parameters)
-    AppScaleLogger.verbose("Terminating the vm instance/s '{}'".
+    AppScaleLogger.verbose("Terminating the vm instance(s) '{}'".
                            format(instance_ids), verbose)
     compute_client = ComputeManagementClient(credentials, subscription_id)
-    threads = []
-    # Delete the virtual machines created outside of the scale set.
-    for vm_name in instance_ids:
-      thread = threading.Thread(
-        target=self.delete_virtual_machine, args=(
-          compute_client, resource_group, verbose, vm_name))
-      thread.start()
-      threads.append(thread)
-    for x in threads:
-      x.join()
 
     # Delete the virtual machine scale sets created.
     vmss_list = compute_client.virtual_machine_scale_sets.list(resource_group)
     vmss_delete_threads = []
+    ss_instance_ids_to_delete = []
     for vmss in vmss_list:
+      vm_list = compute_client.virtual_machine_scale_set_vms.list(
+        resource_group, vmss.name)
+      for vm in vm_list:
+        ss_instance_ids_to_delete.append(vm.name)
       thread = threading.Thread(
         target=self.delete_virtual_machine_scale_set, args=(
           compute_client, resource_group, verbose, vmss.name))
       thread.start()
-      thread.append(thread)
-    for x in vmss_delete_threads:
-      x.join()
+      vmss_delete_threads.append(thread)
+
+    # Delete the virtual machines created outside of the scale set.
+    lb_instance_ids_to_delete = self.diff(instance_ids, ss_instance_ids_to_delete)
+    load_balancer_threads = []
+    for vm_name in lb_instance_ids_to_delete:
+      thread = threading.Thread(
+        target=self.delete_virtual_machine, args=(
+          compute_client, resource_group, verbose, vm_name))
+      thread.start()
+      load_balancer_threads.append(thread)
+
+    for delete_thread in vmss_delete_threads:
+      delete_thread.join()
+
+    AppScaleLogger.log("Virtual machine scale set(s) have been successfully "
+                       "deleted.")
+
+    for load_balancer in load_balancer_threads:
+      load_balancer.join()
+
+    AppScaleLogger.log("Load balancer virtual machine(s) have been successfully "
+                       "deleted")
 
   def delete_virtual_machine_scale_set(self, compute_client, resource_group,
-                                        verbose, scale_set_name):
+                                       verbose, scale_set_name):
     """ Deletes the virtual machine scale set created from the specified
     resource group.
     Args:
@@ -571,20 +609,15 @@ class AzureAgent(BaseAgent):
         verbose: A boolean indicating whether or not the verbose mode is on.
         scale_set_name: The name of the virtual machine scale set to be deleted.
     """
-    AppScaleLogger.verbose("Deleting Scale Set {}".format(scale_set_name), verbose)
-    delete_response = compute_client.virtual_machine_scale_sets.delete(
-      resource_group,scale_set_name)
+    AppScaleLogger.verbose("Deleting Scale Set {} ...".format(scale_set_name), verbose)
     try:
-      delete_response.wait(timeout=self.MAX_VMSS_WAIT_TIME)
-      result = delete_response.result()
-      if result.provisioning_state == 'Succeeded':
-        AppScaleLogger.log("Scale Set '{0}' has been successfully "
-                           "deleted!".format(scale_set_name))
-      else:
-        AppScaleLogger.log("Unable to delete the Scale Set {0}. "
-                           "Provisioning Status: {1}"
-                           .format(scale_set_name, result.provisioning_state))
-
+      delete_response = compute_client.virtual_machine_scale_sets.delete(
+        resource_group,scale_set_name)
+      resource_name = 'Virtual Machine Scale Set' + ":" + scale_set_name
+      self.sleep_until_delete_operation_done(delete_response, resource_name,
+                                             self.MAX_VM_UPDATE_TIME, verbose)
+      AppScaleLogger.verbose("Virtual Machine Scale Set {} has been successfully "
+                             "deleted.".format(scale_set_name), verbose)
     except CloudError as error:
       raise AgentConfigurationException("There was a problem while deleting the "
                                         "Scale Set {0} due to the error: {1}"
@@ -599,10 +632,13 @@ class AzureAgent(BaseAgent):
       verbose: A boolean indicating whether or not the verbose mode is on.
       vm_name: The name of the virtual machine to be deleted.
     """
+    AppScaleLogger.verbose("Deleting Virtual Machine {} ...".format(vm_name), verbose)
     result = compute_client.virtual_machines.delete(resource_group, vm_name)
     resource_name = 'Virtual Machine' + ':' + vm_name
     self.sleep_until_delete_operation_done(result, resource_name,
-                                           self.MAX_VM_CREATION_TIME, verbose)
+                                           self.MAX_VM_UPDATE_TIME, verbose)
+    AppScaleLogger.verbose("Virtual Machine {} has been successfully deleted.".
+                           format(vm_name), verbose)
 
   def sleep_until_delete_operation_done(self, result, resource_name,
                                         max_sleep, verbose):

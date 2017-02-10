@@ -8,10 +8,12 @@ import re
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import tempfile
 import time
 import uuid
+import yaml
 
 
 # AppScale-specific imports
@@ -130,12 +132,30 @@ class RemoteHelper(object):
 
     if login_ip in public_ips:
       AppScaleLogger.log("Reusing already running instances.")
-      # Set newly obtained node layout info for this deployment.
-      for i, _ in enumerate(instance_ids):
-        node_layout.nodes[i].public_ip = public_ips[i]
-        node_layout.nodes[i].private_ip = private_ips[i]
-        node_layout.nodes[i].instance_id = instance_ids[i]
+      # Get the node_info from the locations JSON.
+      node_info = LocalState.get_local_nodes_info(keyname=options.keyname)
 
+      previous_node_list = node_layout.from_locations_json_list(node_info)
+      # If this is None, the AppScalefile has been changed or the nodes could
+      # not be matched up by roles/jobs.
+      if previous_node_list is None:
+        raise BadConfigurationException("AppScale does not currently support "
+                                        "changes to AppScalefile or locations "
+                                        "JSON between a down and an up. If "
+                                        "you would like to "
+                                        "change the node layout use "
+                                        "down --terminate before an up.")
+      node_layout.nodes = previous_node_list
+      for node_index, node in enumerate(node_layout.nodes):
+        try:
+          index = instance_ids.index(node.instance_id)
+        except ValueError:
+          raise BadConfigurationException("Previous instance_id {} does not "
+                                          "currently exist."
+                                          .format(node.instance_id))
+        node_layout.nodes[node_index].public_ip = public_ips[index]
+        node_layout.nodes[node_index].private_ip = private_ips[index]
+        node_layout.nodes[node_index].instance_id = instance_ids[index]
       return node_layout
 
     agent.configure_instance_security(params)
@@ -145,11 +165,11 @@ class RemoteHelper(object):
       options, agent, params,
       len(load_balancer_nodes))
 
-    for i, node in enumerate(load_balancer_nodes):
+    for node_index, node in enumerate(load_balancer_nodes):
       index = node_layout.nodes.index(node)
-      node_layout.nodes[index].public_ip = public_ips[i]
-      node_layout.nodes[index].private_ip = private_ips[i]
-      node_layout.nodes[index].instance_id = instance_ids[i]
+      node_layout.nodes[index].public_ip = public_ips[node_index]
+      node_layout.nodes[index].private_ip = private_ips[node_index]
+      node_layout.nodes[index].instance_id = instance_ids[node_index]
 
     AppScaleLogger.log("\nPlease wait for AppScale to prepare your machines "
                        "for use. This can take few minutes.")
@@ -160,11 +180,11 @@ class RemoteHelper(object):
         agent, params,
         len(other_nodes))
 
-      for i, node in enumerate(other_nodes):
+      for node_index, node in enumerate(other_nodes):
         index = node_layout.nodes.index(node)
-        node_layout.nodes[index].public_ip = _public_ips[i]
-        node_layout.nodes[index].private_ip = _private_ips[i]
-        node_layout.nodes[index].instance_id = _instance_ids[i]
+        node_layout.nodes[index].public_ip = _public_ips[node_index]
+        node_layout.nodes[index].private_ip = _private_ips[node_index]
+        node_layout.nodes[index].instance_id = _instance_ids[node_index]
 
     return node_layout
 
@@ -283,7 +303,8 @@ class RemoteHelper(object):
         that was started.
     """
     instance_ids, public_ips, private_ips = agent.run_instances(
-      count=count, parameters=params, security_configured=True)
+      count=count, parameters=params, security_configured=True,
+      public_ip_needed=True)
 
     if options.static_ip:
       agent.associate_static_ip(params, instance_ids[0], options.static_ip)
@@ -308,7 +329,8 @@ class RemoteHelper(object):
         that was started.
     """
     instance_ids, public_ips, private_ips = agent.run_instances(
-      count=count, parameters=params, security_configured=True)
+      count=count, parameters=params, security_configured=True,
+      public_ip_needed=False)
     return instance_ids, public_ips, private_ips
 
   @classmethod
@@ -915,7 +937,7 @@ class RemoteHelper(object):
 
 
   @classmethod
-  def terminate_virtualized_cluster(cls, keyname, is_verbose):
+  def terminate_virtualized_cluster(cls, keyname, clean, is_verbose):
     """Stops all API services running on all nodes in the currently running
     AppScale deployment.
 
@@ -923,6 +945,7 @@ class RemoteHelper(object):
       keyname: The name of the SSH keypair used for this AppScale deployment.
       is_verbose: A bool that indicates if we should print the commands executed
         to stdout.
+      clean: A bool representing whether clean should be ran on the nodes.
     """
     AppScaleLogger.log("Terminating appscale deployment with keyname {0}"
                        .format(keyname))
@@ -938,41 +961,47 @@ class RemoteHelper(object):
 
     acc = AppControllerClient(shadow_host, secret)
     try:
-      all_ips = acc.get_all_public_ips()
+      machines = len(acc.get_all_public_ips()) - 1
+      acc.run_terminate(clean)
+      terminated_successfully = True
+      log_dump = ""
+      while not acc.is_appscale_terminated():
+        # For terminate receive_server_message will return a JSON string that
+        # is a list of dicts with keys: ip, status, output
+        try:
+          output_list = yaml.safe_load(acc.receive_server_message())
+        except Exception as e:
+          log_dump += e.message
+          continue
+        for node in output_list:
+          if node.get("status"):
+            machines -= 1
+            AppScaleLogger.success("Node at {node_ip}: {status}".format(
+              node_ip=node.get("ip"), status="Terminated Successfully"))
+          else:
+            AppScaleLogger.warn("Node at {node_ip}: {status}".format(
+              node_ip=node.get("ip"), status="Did not terminate successfully"))
+            terminated_successfully = False
+            log_dump += "Node at {node_ip}: {status}\nNode Output:"\
+                        "{output}".format(node_ip=node.get("ip"),
+                                          status="Terminate failed",
+                                          output=node.get("output"))
+          AppScaleLogger.verbose("Output of node at {node_ip}:\n"
+                                 "{output}".format(node_ip=node.get("ip"),
+                                                   output=node.get("output")),
+                                 is_verbose)
+      if not terminated_successfully or machines > 0:
+        LocalState.generate_crash_log(AppControllerException, log_dump)
+        raise AppScaleException("{0} node(s) failed terminating, head node "
+                                "is still running AppScale services."
+                                .format(machines))
+      cls.stop_remote_appcontroller(shadow_host, keyname, is_verbose)
+    except socket.error as socket_error:
+      AppScaleLogger.warn('Unable to talk to AppController: {}'.
+                          format(socket_error.message))
     except Exception as exception:
-      AppScaleLogger.warn('Saw Exception while getting deployments IPs {0}'.
+      AppScaleLogger.warn('Saw Exception while terminating {0}'.
                           format(str(exception)))
-      all_ips = LocalState.get_all_public_ips(keyname)
-
-    threads = []
-    for ip in all_ips:
-      thread = threading.Thread(target=cls.stop_remote_appcontroller, args=(ip,
-        keyname, is_verbose))
-      thread.start()
-      threads.append(thread)
-
-    for thread in threads:
-      thread.join()
-
-    boxes_shut_down = 0
-    is_running_regex = re.compile("appscale-controller stop")
-    for ip in all_ips:
-      AppScaleLogger.log("Shutting down AppScale API services at {0}".
-                         format(ip))
-      while True:
-        remote_output = cls.ssh(ip, keyname, 'ps x', is_verbose)
-        AppScaleLogger.verbose(remote_output, is_verbose)
-        if not is_running_regex.match(remote_output):
-          break
-        time.sleep(0.3)
-      boxes_shut_down += 1
-
-    if boxes_shut_down != len(all_ips):
-      raise AppScaleException("Couldn't terminate your AppScale deployment on"
-                              " all machines - please do so manually.")
-
-    AppScaleLogger.log("Terminated AppScale on {0} machines.".
-                       format(boxes_shut_down))
 
 
   @classmethod
@@ -993,7 +1022,7 @@ class RemoteHelper(object):
 
 
   @classmethod
-  def copy_app_to_host(cls, app_location, keyname, is_verbose):
+  def copy_app_to_host(cls, app_location, keyname, is_verbose, extras=None):
     """Copies the given application to a machine running the Login service
     within an AppScale deployment.
 
@@ -1004,6 +1033,7 @@ class RemoteHelper(object):
         AppScale deployment.
       is_verbose: A bool that indicates if we should print the commands we exec
         to copy the app to the remote host to stdout.
+      extras: A dictionary containing a list of files to include in the upload.
 
     Returns:
       A str corresponding to the location on the remote filesystem where the
@@ -1015,9 +1045,25 @@ class RemoteHelper(object):
     rand = str(uuid.uuid4()).replace('-', '')[:8]
     local_tarred_app = "{0}/appscale-app-{1}-{2}.tar.gz".\
       format(tempfile.gettempdir(), app_id, rand)
-    cmd = "cd '{0}' && COPYFILE_DISABLE=1 tar -czhf {1} --exclude='*.pyc' *".\
-      format(app_location, local_tarred_app)
-    LocalState.shell(cmd, is_verbose)
+
+    # Collect list of files that should be included in the tarball.
+    app_files = {}
+    for root, _, filenames in os.walk(app_location):
+      relative_dir = os.path.relpath(root, app_location)
+      for filename in filenames:
+        # Ignore compiled Python files.
+        if filename.endswith('.pyc'):
+          continue
+        relative_path = os.path.join(relative_dir, filename)
+        app_files[relative_path] = os.path.join(root, filename)
+
+    if extras is not None:
+      app_files.update(extras)
+
+    with tarfile.open(local_tarred_app, 'w:gz') as app_tar:
+      for tarball_path in app_files:
+        local_path = app_files[tarball_path]
+        app_tar.add(local_path, tarball_path)
 
     AppScaleLogger.log("Copying over application")
     remote_app_tar = "{0}/{1}.tar.gz".format(cls.REMOTE_APP_DIR, app_id)

@@ -397,9 +397,6 @@ class AppScaleTools(object):
     secret = LocalState.get_secret_key(options.keyname)
     acc = AppControllerClient(login_host, secret)
 
-    if not acc.is_app_running(options.appname):
-      raise AppScaleException("The given application is not currently running.")
-
     # Makes a call to the AppController to get all the stats and looks
     # through them for the http port the app can be reached on.
     http_port = None
@@ -628,7 +625,8 @@ class AppScaleTools(object):
     # Stop gracefully the AppScale deployment.
     try:
       RemoteHelper.terminate_virtualized_cluster(options.keyname,
-        options.verbose)
+                                                 options.clean,
+                                                 options.verbose)
     except (IOError, AppScaleException):
       # Don't fail if we cannot find the configuration.
       pass
@@ -684,6 +682,10 @@ class AppScaleTools(object):
       file_location)
     AppEngineHelper.validate_app_id(app_id)
 
+    extras = {}
+    if app_language == 'go':
+      extras = LocalState.get_extra_go_dependencies(options.file, options.test)
+
     if app_language == 'java':
       if AppEngineHelper.is_sdk_mismatch(file_location):
         AppScaleLogger.warn('AppScale did not find the correct SDK jar ' +
@@ -724,7 +726,7 @@ class AppScaleTools(object):
       AppScaleLogger.log("Ignoring .pyc files")
 
     remote_file_path = RemoteHelper.copy_app_to_host(file_location,
-      options.keyname, options.verbose)
+      options.keyname, options.verbose, extras)
 
     acc.done_uploading(app_id, remote_file_path)
     acc.update([app_id])
