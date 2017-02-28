@@ -538,7 +538,7 @@ class RemoteHelper(object):
     ssh_key = LocalState.get_key_path_from_name(keyname)
     cls.scp(host, keyname, ssh_key, '/root/.ssh/id_dsa', is_verbose)
     cls.scp(host, keyname, ssh_key, '/root/.ssh/id_rsa', is_verbose)
-    cls.scp(host, keyname, ssh_key, '/root/.appscale/{0}.key'.format(keyname),
+    cls.scp(host, keyname, ssh_key, '{}/{}.key'.format(cls.CONFIG_DIR, keyname),
       is_verbose)
 
   @classmethod
@@ -782,11 +782,11 @@ class RemoteHelper(object):
     """
     # and copy the json file if the tools on that box wants to use it
     cls.scp(host, keyname, LocalState.get_locations_json_location(keyname),
-      '/root/.appscale/locations-{0}.json'.format(keyname), is_verbose)
+      '{}/locations-{}.json'.format(cls.CONFIG_DIR, keyname), is_verbose)
 
     # and copy the secret file if the tools on that box wants to use it
     cls.scp(host, keyname, LocalState.get_secret_key_location(keyname),
-      '/root/.appscale/', is_verbose)
+      cls.CONFIG_DIR, is_verbose)
 
 
   @classmethod
@@ -912,8 +912,13 @@ class RemoteHelper(object):
     params[agent.PARAM_INSTANCE_IDS] = instance_ids
     agent.terminate_instances(params)
 
-    # delete the keyname and group
+    # Delete the network configuration created for the cloud.
     agent.cleanup_state(params)
+
+    # Cleanup the keyname files created on the local filesystem.
+    # For GCE and Azure, the keypairs are created on the filesystem,
+    # rather than the cloud. So we have to clean up afterwards.
+    LocalState.cleanup_keyname(keyname)
 
 
   @classmethod
@@ -995,7 +1000,7 @@ class RemoteHelper(object):
         raise AppScaleException("{0} node(s) failed terminating, head node "
                                 "is still running AppScale services."
                                 .format(machines))
-      cls.stop_remote_appcontroller(shadow_host, keyname, is_verbose)
+      cls.stop_remote_appcontroller(shadow_host, keyname, is_verbose, clean)
     except socket.error as socket_error:
       AppScaleLogger.warn('Unable to talk to AppController: {}'.
                           format(socket_error.message))
@@ -1005,20 +1010,20 @@ class RemoteHelper(object):
 
 
   @classmethod
-  def stop_remote_appcontroller(cls, host, keyname, is_verbose):
+  def stop_remote_appcontroller(cls, host, keyname, is_verbose, clean=False):
     """Stops the AppController daemon on the specified host.
-
-    Tries the stop command twice, just to make sure that the AppController gets
-    the message.
 
     Args:
       host: The location of the AppController to stop.
       keyname: The name of the SSH keypair used for this AppScale deployment.
       is_verbose: A bool that indicates if we should print the stop commands we
         exec to stdout.
+      clean: A boolean that specifies whether or not to clean persistent state.
     """
-    cls.ssh(host, keyname, 'ruby /root/appscale/AppController/terminate.rb',
-            is_verbose)
+    terminate_cmd = 'ruby /root/appscale/AppController/terminate.rb'
+    if clean:
+      terminate_cmd += ' clean'
+    cls.ssh(host, keyname, terminate_cmd, is_verbose)
 
 
   @classmethod
@@ -1048,7 +1053,7 @@ class RemoteHelper(object):
 
     # Collect list of files that should be included in the tarball.
     app_files = {}
-    for root, _, filenames in os.walk(app_location):
+    for root, _, filenames in os.walk(app_location, followlinks=True):
       relative_dir = os.path.relpath(root, app_location)
       for filename in filenames:
         # Ignore compiled Python files.
