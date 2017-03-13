@@ -254,7 +254,7 @@ class RemoteHelper(object):
       if agent.PARAM_REGION in params:
         additional_params[agent.PARAM_REGION] = params[agent.PARAM_REGION]
 
-    time.sleep(10)  # gives machines in cloud extra time to boot up
+      time.sleep(10)  # gives machines in cloud extra time to boot up
 
     cls.copy_deployment_credentials(head_node, options)
 
@@ -1004,9 +1004,11 @@ class RemoteHelper(object):
     except socket.error as socket_error:
       AppScaleLogger.warn('Unable to talk to AppController: {}'.
                           format(socket_error.message))
+      raise
     except Exception as exception:
       AppScaleLogger.warn('Saw Exception while terminating {0}'.
                           format(str(exception)))
+      raise
 
 
   @classmethod
